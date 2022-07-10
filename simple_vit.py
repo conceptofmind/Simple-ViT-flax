@@ -4,8 +4,6 @@ import jax
 import jax.numpy as jnp
 from jax.numpy import einsum
 
-from typing import Callable
-
 from einops import rearrange
 
 # helpers
@@ -13,8 +11,8 @@ from einops import rearrange
 def pair(t):
     return t if isinstance(t, tuple) else (t, t)
 
-def posemb_sincos_2d(patches, temperature = 10000, dtype = jnp.float32):
-    _, h, w, dim, dtype = *patches.shape, patches.dtype
+def posemb_sincos_2d(patches, temperature = 10000):
+    _, h, w, dim = patches.shape
 
     y, x = jnp.meshgrid(jnp.arange(h), jnp.arange(w), indexing = 'ij')
     assert (dim % 4) == 0, 'feature dimension must be multiple of 4 for sincos emb'
@@ -23,10 +21,16 @@ def posemb_sincos_2d(patches, temperature = 10000, dtype = jnp.float32):
 
     y = y.flatten()[:, None] * omega[None, :]
     x = x.flatten()[:, None] * omega[None, :] 
-    pe = jnp.concatenate((x.sin(), x.cos(), y.sin(), y.cos()), axis = 1)
-    return pe.type(dtype)
+    pe = jnp.concatenate((jnp.sin(x), jnp.cos(x), jnp.sin(y), jnp.cos(y)), axis = 1)
+    return pe
 
 # classes
+
+class IdentityLayer(nn.Module):
+
+  @nn.compact
+  def __call__(self, x):
+    return x
 
 class FeedForward(nn.Module):
     dim: int
@@ -54,11 +58,11 @@ class Attention(nn.Module):
         norm = nn.LayerNorm(epsilon = 1e-5, use_bias = False)
 
         to_qkv = nn.Dense(inner_dim * 3, use_bias = False)
-        to_out = nn.Linear(self.dim, use_bias = False)
+        to_out = nn.Dense(self.dim, use_bias = False)
 
         x = norm(x)
 
-        qkv = to_qkv(x).chunk(3, dim = -1)
+        qkv = to_qkv(x).split(3, axis = -1)
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = heads), qkv)
 
         dots = einsum('b h i d, b h j d -> b h i j', q, k) * scale
@@ -66,7 +70,7 @@ class Attention(nn.Module):
         attn = nn.softmax(dots, axis = -1)
 
         x = einsum('b h i j, b h j d -> b h i d', attn, v)
-        out = rearrange(out, 'b h n d -> b n (h d)')
+        out = rearrange(x, 'b h n d -> b n (h d)')
         return to_out(out)
 
 class Transformer(nn.Module):
@@ -111,28 +115,22 @@ class SimpleViT(nn.Module):
 
         assert image_height % patch_height == 0 and image_width % patch_width == 0, 'Image dimensions must be divisible by the patch size.'
 
-        num_patches = (image_height // patch_height) * (image_width // patch_width)
-        patch_dim = self.channels * patch_height * patch_width
-
         transformer = Transformer(self.dim, self.depth, self.heads, self.dim_head, self.mlp_dim)
 
-        #to_latent = nn.Identity()
-        linear_head = nn.Sequential(
+        linear_head = nn.Sequential([
             nn.LayerNorm(epsilon = 1e-5, use_bias = False),
             nn.Dense(features = self.num_classes)
-        )
+        ])
 
-        *_, h, w, dtype = *img.shape, img.dtype
-
-        x = rearrange(img, 'b c (h p1) (w p2) c -> b h w (p1 p2 c)', p1 = self.patch_size, p2 = self.patch_size)
+        x = rearrange(img, 'b c (h p1) (w p2) -> b h w (p1 p2 c)', p1 = patch_height, p2 = patch_width)
         x = nn.Dense(features = self.dim)(x)
         pe = posemb_sincos_2d(x)
         x = rearrange(x, 'b ... d -> b (...) d') + pe
 
         x = transformer(x)
-        x = x.mean(dim = 1)
+        x = x.mean(axis = 1)
 
-        #x = self.to_latent(x)
+        x = IdentityLayer()(x)
         return linear_head(x)
 
 if __name__ == "__main__":
@@ -141,18 +139,16 @@ if __name__ == "__main__":
 
     key = jax.random.PRNGKey(0)
 
-    img = jax.random.normal(key, (1, 256, 256, 3))
+    img = jax.random.normal(key, (1, 3, 256, 256))
 
     v = SimpleViT(
         image_size = 256,
         patch_size = 32,
         num_classes = 1000,
         dim = 1024,
-        depth = 12,             # depth of transformer for patch to patch attention only
+        depth = 6,
         heads = 16,
-        mlp_dim = 2048,
-        channels = 3,
-        dim_head = 64
+        mlp_dim = 2048
     )
 
     init_rngs = {'params': jax.random.PRNGKey(1), 
